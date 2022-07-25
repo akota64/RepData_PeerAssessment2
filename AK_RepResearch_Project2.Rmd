@@ -10,9 +10,180 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 ## Synopsis
-
+Using US NOAA's Storm Data database, we attempt to find the types of events that are (1) most harmful to health of the population, and (2) have the most severe economic effects. The data is first pre-processed to obtain reasonable metrics to gauge the health and economic effects. Then, the analysis is carried out by looking at the totals and averages of these metrics across event types, and make a reasonable claim about the types of events with the largest effects. Through the analysis, we found that *results here*.
 
 ## Data Processing
+First, we download the data and load the file into R for analysis. Since the data is in a bzip2 file, we must load the data using the read.csv() function along with the bzfile() function, as done below. We start from this stage for reproducibility (no external pre-processing). We also load the dplyr library, which will be used in analysis. 
+```{r load_libs}
+library(dplyr)
+```
+
+```{r download_and_load_data, cache=TRUE}
+if(!file.exists("storm_data.csv.bz2")){
+    download.file("https://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2", 
+                  "storm_data.csv.bz2")
+}
+dat <- read.csv(bzfile("storm_data.csv.bz2"))
+```
+Looking at the structure of our data frame, we see the following columns and classes:
+```{r str, cache=TRUE}
+str(dat)
+```
+If restricted to these data, human health can only be gauged using the FATALITIES and INJURIES data. These columns already have well-typed values, so no pre-processing is needed here.  
+  
+On the other hand, we will need to use PROPDMG, PROPDMGEXP, CROPDMG and CROPDMGEXP to evaluate economic consequences across climate events. The DMGEXP variables are character representations of what power of ten needs to be multiplied by the DMG to get the total cost of a given event, so we will go through the data and combine the DMG and DMGEXP to get TOTAL_PROP_DMG and TOTAL_CROP_DMG, which contain a numeric value for the cost. Adding these two columns can get us the TOTAL_ECON_DMG for any given event.  
+  
+To do this, we first need to look at the unique values in each of the DMGEXP columns.
+```{r unique_dmg_exp}
+unique(dat$PROPDMGEXP)
+unique(dat$CROPDMGEXP)
+```
+
+The numbers represent the magnitude, or exponent of ten, of the PROPDMG or CROPDMG. The letters "H", K", "M", "B" represent hundred, thousand, million, and billion, respectively. Let's get rid of letters and other symbols in favor of numbers first, and then turn the DMGEXP columns into numerics to ease our next  pre-processing steps. The columns are copied into a separate variable first for safety.
+```{r process_dmg_exp}
+proc_pde <- sub("[Hh]", "2", dat$PROPDMGEXP)
+proc_pde <- sub("[Kk]", "3", proc_pde)
+proc_pde <- sub("[Mm]", "6", proc_pde)
+proc_pde <- sub("[Bb]", "9", proc_pde)
+unique(proc_pde)
+
+proc_cde <- sub("[Hh]", "2", dat$CROPDMGEXP)
+proc_cde <- sub("[Kk]", "3", proc_cde)
+proc_cde <- sub("[Mm]", "6", proc_cde)
+proc_cde <- sub("[Bb]", "9", proc_cde)
+unique(proc_cde)
+```
+Now, we need to deal with the special characters, "+", "-", "?" and "". For "+" and "-", we can reasonably replace these with "0", since the order of magnitude will likely be around the same as the give damage value.
+```{r process_dmg_exp2}
+proc_pde <- sub("(\\+)|(-)", "0", proc_pde)
+proc_cde <- sub("(\\+)|(-)", "0", proc_cde)
+```
+Now, let's look at the values in the damage column where "?" and "" are used.
+```{r}
+unique(subset(dat, PROPDMGEXP=="?")$PROPDMG)
+unique(subset(dat, CROPDMGEXP=="?")$CROPDMG)
+unique(subset(dat, PROPDMGEXP=="")$PROPDMG)
+unique(subset(dat, CROPDMGEXP=="")$CROPDMG)
+```
+So the "?" and "" can both be reasonably replaced by 0. Then, we transform the processed column copies into numerics and input them into the data frame.
+```{r process_dmg_exp_final}
+proc_pde <- sub("(\\?)|(^$)", "0", proc_pde)
+proc_cde <- sub("(\\?)|(^$)", "0", proc_cde)
+
+proc_pde <- as.numeric(proc_pde)
+proc_cde <- as.numeric(proc_cde)
+
+dat$PROPDMGEXP <- proc_pde
+dat$CROPDMGEXP <- proc_cde
+
+rm(list=c("proc_pde","proc_cde"))
+```
+
+Now, we can check that the four damage columns are now numerics without NA's.
+```{r process_check}
+str(select(dat, PROPDMG:CROPDMGEXP))
+sum(is.na(select(dat, PROPDMG:CROPDMGEXP)))
+```
+
+Lastly, we combine the columns DMG and DMGEXP for PROP and CROP into TOTALPROPDMG and TOTALCROPDMG, which are then added to get TOTALECONDMG.
+```{r total_econ_dmg}
+df <- dat %>% 
+    mutate(TOTALPROPDMG = (PROPDMG *(10^PROPDMGEXP)), 
+           TOTALCROPDMG = (CROPDMG *(10^CROPDMGEXP))) %>%
+    mutate(TOTALECONDMG = TOTALPROPDMG + TOTALCROPDMG)
+```
+We can check that this operation worked by looking at the first element where TOTALPROPDMG and TOTALCROPDMG are nonzero.
+```{r process_check2}
+select(
+    head(subset(df, TOTALPROPDMG!=0 & TOTALCROPDMG!=0), 1),
+    PROPDMG:CROPDMGEXP, TOTALPROPDMG:TOTALECONDMG
+)
+```
+This is, in fact, the expected result.
+  
+Now, we will trim down our dataset for analysis and clear up some memory. We will be constructing 2 new data frames: one with health data (averages and totals of fatalities and injuries) by event type and one with economic data (averages and totals of property damage, crop damage, and total damage) by event type. We will also be clearing unnecessary data to free up memory.
+```{r process_data_for_analysis}
+health_data <- df %>% 
+    group_by(EVTYPE) %>% 
+    summarize( 
+        count=n(),
+        total_fatal=sum(FATALITIES),
+        total_inj=sum(INJURIES),
+        avg_fatal=mean(FATALITIES),
+        avg_inj=mean(INJURIES)
+    ) %>%
+    rename(event_type=EVTYPE)
+econ_data <- df %>% 
+    group_by(EVTYPE) %>% 
+    summarize(
+        count=n(),
+        total_dmg=sum(TOTALECONDMG),
+        total_prop_dmg=sum(TOTALPROPDMG),
+        total_crop_dmg=sum(TOTALCROPDMG),
+        avg_dmg=mean(TOTALECONDMG),
+        avg_prop_dmg=mean(TOTALPROPDMG),
+        avg_crop_dmg=mean(TOTALCROPDMG)
+    ) %>%
+    rename(event_type=EVTYPE)
+rm("dat")
+```
+
+We can now delve into these prepared data sets and analyze health and economic outcomes by event type.
+
+## Health Data Analysis
+
+We seek to the answer the question of what event type are most harmful to population health. To do this, we will look at the health_data table constructed in the Data Processing section, sorted by most average fatalities and most average injuries.
+```{r health_worst_means}
+head(arrange(health_data, desc(avg_fatal)), 10)
+head(arrange(health_data, desc(avg_inj)), 10)
+```
+There seem to be several "one-off" low-count type events that are popping up at the top of the list. Since we are looking for harm to population health across the US, let's discard these in some way. For now, we have chosen to look at only the event types with at least 10 events in count. Looking at this data
+```{r health_worst_means2}
+pruned_health_data <- subset(health_data, count>=10)
+head(arrange(pruned_health_data, desc(avg_fatal)), 10)
+head(arrange(pruned_health_data, desc(avg_inj)), 10)
+```
+
+At the top of both lists, we see excessive/extreme heat-related event types. It does seem that the data holds several event types for the same/similar events, but this is not an issue for our basic analyses.  
+  
+Now, let's look at the pruned data by total fatalities and injuries. This will tend to make events with higher count naturally rise to the top anyways, and also accounts somewhat for some events being more common than others, and so more injurious to population health.
+```{r health_worst_totals}
+head(arrange(pruned_health_data, desc(total_fatal)), 10)
+head(arrange(pruned_health_data, desc(total_inj)), 10)
+```
+The only event types that occur in both the worst 10 average and worst 10 total lists are excessive heat-related types and rip current-related types. We can make this a bit more precise by finding the "rank" of every event in each of these lists and finding the average of that as a "health score". The item with the lowest "health score" can then be chosen as the most harmful to health. This procedure will help to account for both average harm to health, and frequency of harm to health (using the totals).
+```{r rank_event_types_health}
+ranked_health_data <- pruned_health_data %>%
+    mutate(
+        avg_fatal_rank = 0,
+        avg_inj_rank = 0,
+        total_fatal_rank = 0,
+        total_inj_rank = 0
+    )
+for(x in 1:nrow(ranked_health_data)) {
+    ranked_health_data[x,]$avg_fatal_rank = head(which(
+        arrange(pruned_health_data, desc(avg_fatal))$avg_fatal==ranked_health_data[x,]$avg_fatal
+    ),1)
+    ranked_health_data[x,]$avg_inj_rank = head(which(
+        arrange(pruned_health_data, desc(avg_inj))$avg_inj==ranked_health_data[x,]$avg_inj
+    ),1)
+    ranked_health_data[x,]$total_fatal_rank = head(which(
+        arrange(pruned_health_data, desc(total_fatal))$total_fatal==ranked_health_data[x,]$total_fatal
+    ),1)
+    ranked_health_data[x,]$total_inj_rank = head(which(
+        arrange(pruned_health_data, desc(total_inj))$total_inj==ranked_health_data[x,]$total_inj
+    ),1)
+}
+ranked_health_data <- mutate(ranked_health_data, 
+                             health_score = (avg_fatal_rank + avg_inj_rank + total_fatal_rank + total_inj_rank)/4)
+select(head(arrange(ranked_health_data, health_score), 10), event_type, avg_fatal_rank:health_score)
+```
+So once again, it appears that heat and excessive heat have, far and away, the worst overall effects on population health. We visualize the results below for the top 5 event types.
+```{r health_plot}
+
+```
+
+## Economic Data Analysis
 
 
 ## Results
